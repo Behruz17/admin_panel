@@ -548,13 +548,28 @@ app.get("/candidateTasks/:id", (req, res) => {
 });
 // Tasks Endpoints end 
 
+// Middleware для проверки роли админа
+const checkAdminRole = (req, res, next) => {
+  const role = req.headers['role'];
+  if (role !== 'admin') {
+    return res.status(403).json({ message: 'Access denied. Admin role required.' });
+  }
+  next();
+};
+
 // Start mentors
-app.post('/mentors', (req, res) => {
-  const { username, password } = req.body;
+app.post('/mentors', checkAdminRole, (req, res) => {
+  const { username, password, role } = req.body;
   const saltRounds = 10;
 
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
+  if (!username || !password || !role) {
+    return res.status(400).json({ error: 'Username, password, and role are required' });
+  }
+
+  // Validate role
+  const validRoles = ['admin', 'op', 'line'];
+  if (!validRoles.includes(role)) {
+    return res.status(400).json({ error: 'Invalid role. Must be one of: admin, op, line' });
   }
 
   bcrypt.hash(password, saltRounds, (err, hashedPassword) => {
@@ -564,19 +579,83 @@ app.post('/mentors', (req, res) => {
     }
 
     const sql = 'INSERT INTO users (username, password, role) VALUES (?, ?, ?)';
-    db.query(sql, [username, hashedPassword, 'mentor'], (err, result) => {
+    db.query(sql, [username, hashedPassword, role], (err, result) => {
       if (err) {
         console.error('Database insert error:', err);
         return res.status(500).json({ message: 'Database error' });
       }
 
-      res.status(201).json({ id: result.insertId, username, role: 'mentor' });
+      res.status(201).json({ id: result.insertId, username, role });
     });
   });
 });
 
-app.get('/mentors', (req, res) => {
-  const sql = 'SELECT id, username, role FROM users WHERE role = "mentor" ORDER BY id DESC';
+// Обновление пользователя
+app.put('/mentors/:id', checkAdminRole, (req, res) => {
+  const { id } = req.params;
+  const { username, password, role } = req.body;
+
+  // Validate role
+  const validRoles = ['admin', 'op', 'line'];
+  if (!validRoles.includes(role)) {
+    return res.status(400).json({ error: 'Invalid role. Must be one of: admin, op, line' });
+  }
+
+  // Если пароль предоставлен, обновляем его вместе с другими данными
+  if (password) {
+    bcrypt.hash(password, 10, (err, hashedPassword) => {
+      if (err) {
+        console.error('Hashing error:', err);
+        return res.status(500).json({ message: 'Password encryption failed' });
+      }
+
+      const sql = 'UPDATE users SET username = ?, password = ?, role = ? WHERE id = ?';
+      db.query(sql, [username, hashedPassword, role, id], (err, result) => {
+        if (err) {
+          console.error('Update error:', err);
+          return res.status(500).json({ message: 'Database error' });
+        }
+        if (result.affectedRows === 0) {
+          return res.status(404).json({ message: 'User not found' });
+        }
+        res.json({ message: 'User updated successfully', id, username, role });
+      });
+    });
+  } else {
+    // Если пароль не предоставлен, обновляем только имя пользователя и роль
+    const sql = 'UPDATE users SET username = ?, role = ? WHERE id = ?';
+    db.query(sql, [username, role, id], (err, result) => {
+      if (err) {
+        console.error('Update error:', err);
+        return res.status(500).json({ message: 'Database error' });
+      }
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      res.json({ message: 'User updated successfully', id, username, role });
+    });
+  }
+});
+
+// Удаление пользователя
+app.delete('/mentors/:id', checkAdminRole, (req, res) => {
+  const { id } = req.params;
+  
+  const sql = 'DELETE FROM users WHERE id = ?';
+  db.query(sql, [id], (err, result) => {
+    if (err) {
+      console.error('Delete error:', err);
+      return res.status(500).json({ message: 'Database error' });
+    }
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json({ message: 'User deleted successfully' });
+  });
+});
+
+app.get('/mentors', checkAdminRole, (req, res) => {
+  const sql = 'SELECT id, username, role FROM users ORDER BY id DESC';
 
   db.query(sql, (err, results) => {
     if (err) {
@@ -700,6 +779,227 @@ app.delete('/adaptation-plan/:id', (req, res) => {
 });
 
 // Adaptation Plan end
+
+// Adaptation Plans Routes
+app.get('/api/users/mentors', (req, res) => {
+  const sql = 'SELECT id, username FROM users WHERE role = "op"';
+  db.query(sql, (err, results) => {
+    if (err) {
+      console.error('Error fetching mentors:', err);
+      return res.status(500).json({ message: 'Server error' });
+    }
+    res.json(results);
+  });
+});
+
+app.get('/api/candidates/trainees', (req, res) => {
+  const sql = `
+    SELECT 
+      id,
+      CONCAT(COALESCE(first_name, ''), ' ', COALESCE(last_name, '')) AS username
+    FROM candidates 
+    WHERE status = 'accepted'
+  `;
+  db.query(sql, (err, results) => {
+    if (err) {
+      console.error('Error fetching trainees:', err);
+      return res.status(500).json({ message: 'Server error' });
+    }
+    res.json(results);
+  });
+});
+
+app.get('/api/staff-adaptation-plans', (req, res) => {
+  const role = req.headers['role'];
+  const userId = req.headers['userid'];
+  const planType = req.query.type || 'op'; // Default to 'op' if not specified
+
+  let sql = `
+    SELECT 
+      p.*,
+      u.username as mentor_username,
+      CONCAT(COALESCE(c.first_name, ''), ' ', COALESCE(c.last_name, '')) as trainee_username
+    FROM staff_adaptation_plans p
+    JOIN users u ON p.mentor_id = u.id
+    JOIN candidates c ON p.trainee_id = c.id
+    WHERE p.plan_type = ?
+  `;
+
+  // If not admin, only show plans where user is mentor
+  if (role !== 'admin') {
+    sql += ' AND p.mentor_id = ?';
+  }
+  
+  sql += ' ORDER BY p.created_at DESC';
+  
+  const queryParams = role === 'admin' ? [planType] : [planType, userId];
+  
+  db.query(sql, queryParams, (err, results) => {
+    if (err) {
+      console.error('Error fetching plans:', err);
+      return res.status(500).json({ message: 'Server error' });
+    }
+
+    const plans = results.map(plan => ({
+      id: plan.id,
+      mentor_id: plan.mentor_id,
+      trainee_id: plan.trainee_id,
+      start_date: plan.start_date,
+      end_date: plan.end_date,
+      mentor: {
+        id: plan.mentor_id,
+        username: plan.mentor_username
+      },
+      trainee: {
+        id: plan.trainee_id,
+        username: plan.trainee_username
+      }
+    }));
+
+    res.json(plans);
+  });
+});
+
+app.post('/api/staff-adaptation-plans', (req, res) => {
+  const { mentor_id, trainee_id, start_date, end_date, plan_type = 'op' } = req.body;
+
+  const sql = `
+    INSERT INTO staff_adaptation_plans 
+    (mentor_id, trainee_id, start_date, end_date, plan_type) 
+    VALUES (?, ?, ?, ?, ?)
+  `;
+
+  db.query(sql, [mentor_id, trainee_id, start_date, end_date, plan_type], (err, result) => {
+    if (err) {
+      console.error('Error creating plan:', err);
+      return res.status(500).json({ message: 'Server error' });
+    }
+    res.status(201).json({ id: result.insertId });
+  });
+});
+
+app.put('/api/staff-adaptation-plans/:id', (req, res) => {
+  const { id } = req.params;
+  const { mentor_id, trainee_id, start_date, end_date } = req.body;
+
+  const sql = `
+    UPDATE staff_adaptation_plans 
+    SET mentor_id = ?, 
+        trainee_id = ?, 
+        start_date = ?,
+        end_date = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `;
+
+  db.query(sql, [mentor_id, trainee_id, start_date, end_date, id], (err, result) => {
+    if (err) {
+      console.error('Error updating plan:', err);
+      return res.status(500).json({ message: 'Server error' });
+    }
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Plan not found' });
+    }
+    res.json({ message: 'Plan updated successfully' });
+  });
+});
+
+app.delete('/api/staff-adaptation-plans/:id', (req, res) => {
+  const { id } = req.params;
+
+  const sql = 'DELETE FROM staff_adaptation_plans WHERE id = ?';
+  
+  db.query(sql, [id], (err, result) => {
+    if (err) {
+      console.error('Error deleting plan:', err);
+      return res.status(500).json({ message: 'Server error' });
+    }
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Plan not found' });
+    }
+    res.json({ message: 'Plan deleted successfully' });
+  });
+});
+
+// Admin Adaptation Plan Routes
+app.get('/adaptation-plan/admin', (req, res) => {
+  const role = req.headers['role'];
+  const userId = req.headers['userid'];
+
+  if (role !== 'admin') {
+    return res.status(403).json({ message: 'Forbidden' });
+  }
+
+  const sql = `
+    SELECT adaptation_plans.*, users.username 
+    FROM adaptation_plans 
+    JOIN users ON users.id = adaptation_plans.user_id
+  `;
+  
+  db.query(sql, (err, results) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ message: 'Database error' });
+    }
+    res.json(results);
+  });
+});
+
+app.post('/adaptation-plan/admin', (req, res) => {
+  const { mentor_id, link, role } = req.body;
+
+  if (role !== 'admin') {
+    return res.status(403).json({ message: 'Forbidden' });
+  }
+
+  const sql = 'INSERT INTO adaptation_plans (user_id, link) VALUES (?, ?)';
+  db.query(sql, [mentor_id, link], (err, result) => {
+    if (err) {
+      console.error('Insert error:', err);
+      return res.status(500).json({ message: 'Database error' });
+    }
+
+    res.status(201).json({ message: 'Plan added' });
+  });
+});
+
+app.put('/adaptation-plan/admin/:id', (req, res) => {
+  const { mentor_id, link, role } = req.body;
+  const planId = req.params.id;
+
+  if (role !== 'admin') {
+    return res.status(403).json({ message: 'Forbidden' });
+  }
+
+  const sql = 'UPDATE adaptation_plans SET user_id = ?, link = ? WHERE id = ?';
+  db.query(sql, [mentor_id, link, planId], (err) => {
+    if (err) {
+      console.error('Update error:', err);
+      return res.status(500).json({ message: 'Database error' });
+    }
+
+    res.json({ message: 'Plan updated' });
+  });
+});
+
+app.delete('/adaptation-plan/admin/:id', (req, res) => {
+  const { role } = req.headers;
+  const planId = req.params.id;
+
+  if (role !== 'admin') {
+    return res.status(403).json({ message: 'Forbidden' });
+  }
+
+  const sql = 'DELETE FROM adaptation_plans WHERE id = ?';
+  db.query(sql, [planId], (err) => {
+    if (err) {
+      console.error('Delete error:', err);
+      return res.status(500).json({ message: 'Database error' });
+    }
+
+    res.json({ message: 'Plan deleted' });
+  });
+});
 
 // Start the server
 const PORT = process.env.PORT || 5000;
